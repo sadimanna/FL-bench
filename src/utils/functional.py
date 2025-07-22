@@ -14,7 +14,6 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from src.utils.constants import DEFAULTS
 from src.utils.metrics import Metrics
-from src.utils.models import DecoupledModel
 
 
 def fix_random_seed(seed: int, use_cuda=False) -> None:
@@ -63,7 +62,7 @@ def get_optimal_cuda_device(use_cuda: bool) -> torch.device:
 
 
 def vectorize(
-    src: OrderedDict[str, torch.Tensor] | list[torch.Tensor] | torch.nn.Module,
+    src, #: OrderedDict | list | torch.nn.Module, #[str, torch.Tensor] | list[torch.Tensor] | torch.nn.Module,
     detach=True,
 ) -> torch.Tensor:
     """Vectorize(Flatten) and concatenate all tensors in `src`.
@@ -88,7 +87,7 @@ def vectorize(
 
 @torch.no_grad()
 def evaluate_model(
-    model: DecoupledModel,
+    model: torch.nn.Module,
     dataloader: DataLoader,
     criterion=torch.nn.CrossEntropyLoss(reduction="sum"),
     device=torch.device("cpu"),
@@ -97,7 +96,7 @@ def evaluate_model(
     """For evaluating the `model` over `dataloader` and return metrics.
 
     Args:
-        model (DecoupledModel): Target model.
+        model (torch.nn.Module): Target model.
         dataloader (DataLoader): Target dataloader.
         criterion (optional): The metric criterion. Defaults to torch.nn.CrossEntropyLoss(reduction="sum").
         device (torch.device, optional): The device that holds the computation. Defaults to torch.device("cpu").
@@ -110,7 +109,6 @@ def evaluate_model(
         model.train()
     else:
         model.eval()
-    old_device = model.device
     model.to(device)
     metrics = Metrics()
     for x, y in dataloader:
@@ -119,14 +117,13 @@ def evaluate_model(
         loss = criterion(logits, y).item()
         pred = torch.argmax(logits, -1)
         metrics.update(Metrics(loss, pred, y))
-    model.to(old_device)
     return metrics
 
 
 def parse_args(
     config: DictConfig,
     method_name: str,
-    get_method_args_func: Callable[[Sequence[str] | None], Namespace] | None,
+    get_method_args_func, #: Callable[[Sequence[str] | None], Namespace] | None,
 ) -> DictConfig:
     """Purge arguments from default args dict, config file and CLI and produce
     the final arguments.
@@ -173,8 +170,6 @@ def parse_args(
         "parallel",
     ], f"Unrecongnized mode: {final_args.mode}"
     if final_args.mode == "parallel":
-        import ray
-
         num_available_gpus = final_args.parallel.num_gpus
         num_available_cpus = final_args.parallel.num_cpus
         if num_available_gpus is None:
@@ -188,27 +183,8 @@ def parse_args(
                 num_available_gpus = num_total_gpus
         if num_available_cpus is None:
             num_available_cpus = os.cpu_count()
-
-        try:
-            ray.init(
-                address=config.parallel.ray_cluster_addr,
-                namespace=method_name,
-                num_cpus=num_available_cpus,
-                num_gpus=num_available_gpus,
-                ignore_reinit_error=True,
-            )
-        except ValueError:
-            # have existing cluster
-            # then ignore num_cpus and num_gpus
-            ray.init(
-                address=config.parallel.ray_cluster_addr,
-                namespace=method_name,
-                ignore_reinit_error=True,
-            )
-
-        cluster_resources = ray.cluster_resources()
-        final_args.parallel.num_cpus = cluster_resources["CPU"]
-        final_args.parallel.num_gpus = cluster_resources["GPU"]
+        final_args.parallel.num_gpus = num_available_gpus
+        final_args.parallel.num_cpus = num_available_cpus
         if final_args.parallel.num_workers < 2:
             print(
                 f"num_workers is less than 2: {final_args.parallel.num_workers}, "
@@ -216,7 +192,6 @@ def parse_args(
             )
             final_args.mode = "serial"
             del final_args.parallel
-
     return final_args
 
 

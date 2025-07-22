@@ -18,12 +18,7 @@ class DecoupledModel(nn.Module):
         self.all_features = []
         self.base: nn.Module = None
         self.classifier: nn.Module = None
-        self.dropout: list[nn.Module] = []
-        self.device = torch.device("cpu")
-
-    def to(self, device: torch.device):
-        self.device = device
-        return super().to(device)
+        self.dropout = []  # list of nn.Module
 
     def need_all_features(self):
         target_modules = [
@@ -93,7 +88,7 @@ class DecoupledModel(nn.Module):
 
         return func(out)
 
-    def get_all_features(self, x: Tensor) -> Optional[list[Tensor]]:
+    def get_all_features(self, x):
         feature_list = None
         if len(self.dropout) > 0:
             for dropout in self.dropout:
@@ -151,17 +146,17 @@ class FedAvgCNN(DecoupledModel):
     def __init__(self, dataset: str, pretrained):
         super(FedAvgCNN, self).__init__()
         self.base = nn.Sequential(
-            OrderedDict(
-                conv1=nn.Conv2d(INPUT_CHANNELS[dataset], 32, 5),
-                activation1=nn.ReLU(),
-                pool1=nn.MaxPool2d(2),
-                conv2=nn.Conv2d(32, 64, 5),
-                activation2=nn.ReLU(),
-                pool2=nn.MaxPool2d(2),
-                flatten=nn.Flatten(),
-                fc1=nn.Linear(self.feature_length[dataset], 512),
-                activation3=nn.ReLU(),
-            )
+            OrderedDict([
+                ("conv1", nn.Conv2d(INPUT_CHANNELS[dataset], 32, 5)),
+                ("activation1", nn.ReLU()),
+                ("pool1", nn.MaxPool2d(2)),
+                ("conv2", nn.Conv2d(32, 64, 5)),
+                ("activation2", nn.ReLU()),
+                ("pool2", nn.MaxPool2d(2)),
+                ("flatten", nn.Flatten()),
+                ("fc1", nn.Linear(self.feature_length[dataset], 512)),
+                ("activation3", nn.ReLU()),
+            ])
         )
         self.classifier = nn.Linear(512, NUM_CLASSES[dataset])
 
@@ -188,21 +183,21 @@ class LeNet5(DecoupledModel):
     def __init__(self, dataset: str, pretrained):
         super(LeNet5, self).__init__()
         self.base = nn.Sequential(
-            OrderedDict(
-                conv1=nn.Conv2d(INPUT_CHANNELS[dataset], 6, 5),
-                bn1=nn.BatchNorm2d(6),
-                activation1=nn.ReLU(),
-                pool1=nn.MaxPool2d(2),
-                conv2=nn.Conv2d(6, 16, 5),
-                bn2=nn.BatchNorm2d(16),
-                activation2=nn.ReLU(),
-                pool2=nn.MaxPool2d(2),
-                flatten=nn.Flatten(),
-                fc1=nn.Linear(self.feature_length[dataset], 120),
-                activation3=nn.ReLU(),
-                fc2=nn.Linear(120, 84),
-                activation4=nn.ReLU(),
-            )
+            OrderedDict([
+                ("conv1", nn.Conv2d(INPUT_CHANNELS[dataset], 6, 5)),
+                ("bn1", nn.BatchNorm2d(6)),
+                ("activation1", nn.ReLU()),
+                ("pool1", nn.MaxPool2d(2)),
+                ("conv2", nn.Conv2d(6, 16, 5)),
+                ("bn2", nn.BatchNorm2d(16)),
+                ("activation2", nn.ReLU()),
+                ("pool2", nn.MaxPool2d(2)),
+                ("flatten", nn.Flatten()),
+                ("fc1", nn.Linear(self.feature_length[dataset], 120)),
+                ("activation3", nn.ReLU()),
+                ("fc2", nn.Linear(120, 84)),
+                ("activation4", nn.ReLU()),
+            ])
         )
 
         self.classifier = nn.Linear(84, NUM_CLASSES[dataset])

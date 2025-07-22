@@ -15,16 +15,16 @@ from src.utils.models import DecoupledModel
 class FedAvgClient:
     def __init__(
         self,
-        model: DecoupledModel,
-        optimizer_cls: type[torch.optim.Optimizer],
-        lr_scheduler_cls: type[torch.optim.lr_scheduler.LRScheduler],
-        args: DictConfig,
-        dataset: BaseDataset,
-        data_indices: list,
-        device: torch.device | None,
-        return_diff: bool,
+        model,  # DecoupledModel
+        optimizer_cls,  # type of torch.optim.Optimizer
+        lr_scheduler_cls,  # type of torch.optim.lr_scheduler.LRScheduler
+        args,  # DictConfig
+        dataset,  # BaseDataset
+        data_indices,  # list
+        device,  # torch.device or None
+        return_diff,  # bool
     ):
-        self.client_id: int = None
+        self.client_id = None  # int
         self.args = args
         if device is None:
             self.device = get_optimal_cuda_device(use_cuda=self.args.common.use_cuda)
@@ -32,8 +32,8 @@ class FedAvgClient:
             self.device = device
         self.dataset = dataset
         self.model = model.to(self.device)
-        self.regular_model_params: OrderedDict[str, torch.Tensor]
-        self.personal_params_name: list[str] = []
+        self.regular_model_params = None  # OrderedDict
+        self.personal_params_name = []  # list
         self.regular_params_name = list(key for key, _ in self.model.named_parameters())
         if self.args.common.buffers == "local":
             self.personal_params_name.extend(
@@ -121,7 +121,7 @@ class FedAvgClient:
         eval_results["message"] = eval_msg
         self.eval_results = eval_results
 
-    def set_parameters(self, package: dict[str, Any]):
+    def set_parameters(self, package):
         self.client_id = package["client_id"]
         self.local_epoch = package["local_epoch"]
         self.load_data_indices()
@@ -152,7 +152,7 @@ class FedAvgClient:
                 for key in self.regular_params_name
             )
 
-    def train(self, server_package: dict[str, Any]) -> dict:
+    def train(self, server_package):
         self.set_parameters(server_package)
         self.train_with_eval()
         client_package = self.package()
@@ -174,6 +174,7 @@ class FedAvgClient:
             }
         """
         model_params = self.model.state_dict()
+        # print(model_params.keys())
         client_package = dict(
             weight=len(self.trainset),
             eval_results=self.eval_results,
@@ -223,7 +224,7 @@ class FedAvgClient:
                 self.lr_scheduler.step()
 
     @torch.no_grad()
-    def evaluate(self, model: torch.nn.Module = None) -> dict[str, Metrics]:
+    def evaluate(self, model=None):
         """Evaluating client model.
 
         Args:
@@ -281,7 +282,7 @@ class FedAvgClient:
             )
         return {"train": train_metrics, "val": val_metrics, "test": test_metrics}
 
-    def test(self, server_package: dict[str, Any]) -> dict[str, dict[str, Metrics]]:
+    def test(self, server_package):
         """Test client model. If `finetune_epoch > 0`, `finetune()` will be
         activated.
 

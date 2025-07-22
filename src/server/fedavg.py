@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import numpy as np
-import ray
 import torch
+import torch.distributed as dist
+import wandb
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from rich.console import Console
@@ -50,7 +51,12 @@ class FedAvgServer:
     return_diff = False  # `True` indicates that clients return `diff = W_global - W_local` as parameter update; `False` for `W_local` only.
     client_cls = FedAvgClient
 
-    def __init__(self, args: DictConfig, init_trainer=True, init_model=True):
+    def __init__(
+        self,
+        args: DictConfig,
+        init_trainer=True,
+        init_model=True,
+    ):
         """
         Args:
             `args`: A DictConfig object of the arguments.
@@ -81,14 +87,6 @@ class FedAvgServer:
                 self.data_partition = pickle.load(f)
         except:
             raise FileNotFoundError(f"Please partition {self.args.dataset.name} first.")
-        if (
-            self.args.dataset.split == "user"
-            and self.args.common.test.client.funetune_epoch > 0
-        ):
-            raise RuntimeError(
-                "User-based data partition is not compatible with client-side fine-tuning."
-            )
-
         self.train_clients: List[int] = self.data_partition["separation"]["train"]
         self.test_clients: List[int] = self.data_partition["separation"]["test"]
         self.val_clients: List[int] = self.data_partition["separation"]["val"]
@@ -160,6 +158,7 @@ class FedAvgServer:
             stdout=stdout,
             enable_log=self.args.common.save_log,
             logfile_path=self.output_dir / "main.log",
+            wandb_project=self.args.get("wandb_project", "FL-bench")
         )
         self.test_results: Dict[int, Dict[str, Dict[str, Metrics]]] = {}
         self.train_progress_bar = track(
@@ -168,19 +167,9 @@ class FedAvgServer:
             console=stdout,
         )
 
-        if self.args.common.monitor is not None:
-            self.monitor_window_name_suffix = (
-                self.args.dataset.monitor_window_name_suffix
-            )
-
-        if self.args.common.monitor == "visdom":
-            from visdom import Visdom
-
-            self.viz = Visdom()
-        elif self.args.common.monitor == "tensorboard":
-            from torch.utils.tensorboard import SummaryWriter
-
-            self.tensorboard = SummaryWriter(log_dir=self.output_dir)
+        self.monitor_window_name_suffix = (
+            self.args.dataset.monitor_window_name_suffix
+        )
 
         # init dataset
         self.dataset = self.get_dataset()
@@ -213,9 +202,9 @@ class FedAvgServer:
 
     def init_model(
         self,
-        model: Optional[DecoupledModel] = None,
-        preprocess_func: Optional[Callable[[DecoupledModel], None]] = None,
-        postprocess_func: Optional[Callable[[DecoupledModel], None]] = None,
+        model: Optional = None, #: Optional[DecoupledModel] = None,
+        preprocess_func: Optional = None, #: Optional[Callable[[DecoupledModel], None]] = None,
+        postprocess_func: Optional = None,#: Optional[Callable[[DecoupledModel], None]] = None,
     ):
         """Initialize the global model and client personal model parameters.
 
@@ -284,52 +273,25 @@ class FedAvgServer:
         `[model, args, optimizer_cls, lr_scheduler_cls, dataset, data_indices,
         device, return_diff]`.
         """
-        if self.args.mode == "serial" or self.args.parallel.num_workers < 2:
-            self.trainer = FLbenchTrainer(
-                server=self,
-                client_cls=self.client_cls,
-                mode=MODE.SERIAL,
-                num_workers=0,
-                init_args=dict(
-                    model=deepcopy(self.model),
-                    optimizer_cls=self.get_client_optimizer_cls(),
-                    lr_scheduler_cls=self.get_client_lr_scheduler_cls(),
-                    args=self.args,
-                    dataset=self.dataset,
-                    data_indices=self.client_data_indices,
-                    device=self.device,
-                    return_diff=self.return_diff,
-                    **extras,
-                ),
-            )
-        else:
-            model_ref = ray.put(self.model.cpu())
-            optimzier_cls_ref = ray.put(self.get_client_optimizer_cls())
-            lr_scheduler_cls_ref = ray.put(self.get_client_lr_scheduler_cls())
-            dataset_ref = ray.put(self.dataset)
-            data_indices_ref = ray.put(self.client_data_indices)
-            args_ref = ray.put(self.args)
-            device_ref = ray.put(None)  # in parallel mode, workers decide their device
-            return_diff_ref = ray.put(self.return_diff)
-            self.trainer = FLbenchTrainer(
-                server=self,
-                client_cls=self.client_cls,
-                mode=MODE.PARALLEL,
-                num_workers=int(self.args.parallel.num_workers),
-                init_args=dict(
-                    model=model_ref,
-                    optimizer_cls=optimzier_cls_ref,
-                    lr_scheduler_cls=lr_scheduler_cls_ref,
-                    args=args_ref,
-                    dataset=dataset_ref,
-                    data_indices=data_indices_ref,
-                    device=device_ref,
-                    return_diff=return_diff_ref,
-                    **{key: ray.put(value) for key, value in extras.items()},
-                ),
-            )
+        self.trainer = FLbenchTrainer(
+            server=self,
+            client_cls=self.client_cls,
+            mode=MODE.SERIAL if self.args.mode == "serial" or self.args.parallel.num_workers < 2 else MODE.PARALLEL,
+            num_workers=int(self.args.parallel.num_workers) if self.args.mode != "serial" and self.args.parallel.num_workers >= 2 else 0,
+            init_args=dict(
+                model=deepcopy(self.model),
+                optimizer_cls=self.get_client_optimizer_cls(),
+                lr_scheduler_cls=self.get_client_lr_scheduler_cls(),
+                args=self.args,
+                dataset=self.dataset,
+                data_indices=self.client_data_indices,
+                device=self.device,
+                return_diff=self.return_diff,
+                **extras,
+            ),
+        )
 
-    def get_clients_data_indices(self) -> list[dict[str, list[int]]]:
+    def get_clients_data_indices(self):
         """Gets a list of client data indices.
 
         Load and return the client-side data index from the partition file for the specified dataset.
@@ -338,7 +300,7 @@ class FedAvgServer:
             FileNotFoundError: If the partition file does not exist.
 
         Returns:
-        list[dict[str, list[int]]]: A list of client-side data indexes, where each element is a dictionary,
+        A list of client-side data indexes, where each element is a dictionary,
         Contains the keys "train", "val", and "test" for a list of data indexes for each partition.
         """
         try:
@@ -351,7 +313,7 @@ class FedAvgServer:
             raise FileNotFoundError(f"Please partition {self.args.dataset.name} first.")
 
         # [0: {"train": [...], "val": [...], "test": [...]}, ...]
-        data_indices: list[dict[str, list[int]]] = partition["data_indices"]
+        data_indices = partition["data_indices"]
 
         return data_indices
 
@@ -411,7 +373,7 @@ class FedAvgServer:
             test_target_transform=test_target_transform,
         )
 
-    def get_client_optimizer_cls(self) -> type[torch.optim.Optimizer]:
+    def get_client_optimizer_cls(self): # -> type[torch.optim.Optimizer]:
         """Get client-side model training optimizer.
 
         Returns:
@@ -431,9 +393,7 @@ class FedAvgServer:
         self.args.optimizer = DictConfig(args_valid)
         return optimizer_cls
 
-    def get_client_lr_scheduler_cls(
-        self,
-    ) -> Union[type[torch.optim.lr_scheduler.LRScheduler], None]:
+    def get_client_lr_scheduler_cls(self,): # -> Union[type[torch.optim.lr_scheduler.LRScheduler], None]:
         """Get the client-side learning rate scheduler class. Return None if
         lr_scheduler.name is NOne or no lr_scheduler arguement is provided.
 
@@ -577,7 +537,6 @@ class FedAvgServer:
             for params_dict in self.clients_personal_model_params.values()
         ):
             return
-        self.model.load_state_dict(self.public_model_params, strict=False)
         self.testing = True
         metrics = self.evaluate(
             model_in_train_mode=self.args.common.test.server.model_in_train_mode
@@ -598,7 +557,7 @@ class FedAvgServer:
     @torch.no_grad()
     def evaluate(
         self, model: torch.nn.Module = None, model_in_train_mode: bool = True
-    ) -> dict[str, Metrics]:
+    ): # -> dict[str, Metrics]:
         """Evaluating server model.
 
         Args:
@@ -646,7 +605,7 @@ class FedAvgServer:
             )
         return {"train": train_metrics, "val": val_metrics, "test": test_metrics}
 
-    def get_client_model_params(self, client_id: int) -> OrderedDict[str, torch.Tensor]:
+    def get_client_model_params(self, client_id): #: int) -> OrderedDict[str, torch.Tensor]:
         """This function is for outputting model parameters that asked by
         `client_id`.
 
@@ -667,7 +626,7 @@ class FedAvgServer:
 
     @torch.no_grad()
     def aggregate_client_updates(
-        self, client_packages: OrderedDict[int, Dict[str, Any]]
+        self, client_packages
     ):
         """Aggregate clients model parameters and produce global model
         parameters.
@@ -739,64 +698,24 @@ class FedAvgServer:
                         aggregated.update(
                             self.client_metrics[i][self.current_epoch][stage][split]
                         )
-
                     self.aggregated_client_metrics[stage][split].append(aggregated)
-
-                    if self.args.common.monitor == "visdom":
-                        self.viz.line(
-                            [aggregated.accuracy],
-                            [self.current_epoch],
-                            win=f"Accuracy-{self.monitor_window_name_suffix}/{split}set-{stage}LocalTraining",
-                            update="append",
-                            name=self.algorithm_name,
-                            opts=dict(
-                                title=f"Accuracy-{self.monitor_window_name_suffix}/{split}set-{stage}LocalTraining",
-                                xlabel="Communication Rounds",
-                                ylabel="Accuracy",
-                                legend=[self.algorithm_name],
-                            ),
-                        )
-                    elif self.args.common.monitor == "tensorboard":
-                        self.tensorboard.add_scalar(
-                            f"Accuracy-{self.monitor_window_name_suffix}/{split}set-{stage}LocalTraining",
-                            aggregated.accuracy,
-                            self.current_epoch,
-                            new_style=True,
-                        )
-
+                    # Log to wandb
+                    if self.logger.wandb_run:
+                        wandb.log({
+                            f"Accuracy/{split}/{stage}": aggregated.accuracy,
+                            "epoch": self.current_epoch
+                        })
             # log server side evaluation results
             if (
                 server_side_test_flag
                 and self.current_epoch + 1 in self.test_results
                 and "centralized" in self.test_results[self.current_epoch + 1]
             ):
-                if self.args.common.monitor == "visdom":
-                    self.viz.line(
-                        [
-                            self.test_results[self.current_epoch + 1]["centralized"][
-                                "after"
-                            ][split].accuracy
-                        ],
-                        [self.current_epoch + 1],
-                        win=f"Accuracy-{self.monitor_window_name_suffix}/{split}set-CentralizedEvaluation",
-                        update="append",
-                        name=self.algorithm_name,
-                        opts=dict(
-                            title=f"Accuracy-{self.monitor_window_name_suffix}/{split}set-CentralizedEvaluation",
-                            xlabel="Communication Rounds",
-                            ylabel="Accuracy",
-                            legend=[self.algorithm_name],
-                        ),
-                    )
-                elif self.args.common.monitor == "tensorboard":
-                    self.tensorboard.add_scalar(
-                        f"Accuracy-{self.monitor_window_name_suffix}/{split}set-CentralizedEvaluation",
-                        self.test_results[self.current_epoch + 1]["centralized"][
-                            "after"
-                        ][split].accuracy,
-                        self.current_epoch + 1,
-                        new_style=True,
-                    )
+                if self.logger.wandb_run:
+                    wandb.log({
+                        f"Accuracy/{split}/centralized": self.test_results[self.current_epoch + 1]["centralized"]["after"][split].accuracy,
+                        "epoch": self.current_epoch + 1
+                    })
 
     def show_max_metrics(self):
         """Show the maximum stats that FL method get."""
@@ -947,13 +866,12 @@ class FedAvgServer:
                 console=self.logger.logfile_logger,
                 expand_all=True,
             )
-        if self.args.common.monitor == "tensorboard":
-            self.tensorboard.add_text(
-                f"ExperimentalArguments-{self.monitor_window_name_suffix}",
-                f"{json.dumps(OmegaConf.to_object(self.args), indent=4)}",
-            )
+        # Log experiment config to wandb
+        if self.logger.wandb_run:
+            wandb.config.update(OmegaConf.to_object(self.args))
 
         begin = time.time()
+        # self.trainer.setup()
         try:
             self.train()
         except KeyboardInterrupt:
@@ -1018,13 +936,10 @@ class FedAvgServer:
         }
 
         self.logger.log(json.dumps(all_test_results, indent=4))
-        if self.args.common.monitor == "tensorboard":
+        # Log results to wandb
+        if self.logger.wandb_run:
             for epoch, results in all_test_results.items():
-                self.tensorboard.add_text(
-                    f"Results-{self.monitor_window_name_suffix}",
-                    text_string=f"<pre>{results}</pre>",
-                    global_step=epoch,
-                )
+                wandb.log({f"Results/{self.monitor_window_name_suffix}": str(results), "epoch": epoch})
 
         self.show_max_metrics()
 
@@ -1041,3 +956,5 @@ class FedAvgServer:
         # save trained model(s) parameters
         if self.args.common.save_model:
             self.save_model_weights()
+
+        self.trainer.cleanup()
